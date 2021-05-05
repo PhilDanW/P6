@@ -1,518 +1,703 @@
-#include <stdlib.h>
 #include <stdio.h>
-#include <unistd.h>
-#include <sys/ipc.h>
-#include <sys/shm.h>
-#include <signal.h>
-#include <sys/time.h>
-#include <sys/msg.h>
+#include <errno.h>
+#include <limits.h>
 #include <sys/types.h>
+#include <sys/ipc.h>
+#include <sys/wait.h>
+#include <sys/shm.h>
+#include <semaphore.h>
+#include <sys/stat.h>
+#include <sys/msg.h>
+#include <fcntl.h>
 #include <string.h>
-#include <sys/file.h>
-#include "sharedMem.h"
-#include "queue.h"
+#include <unistd.h>
+#include <stdlib.h>
+#include <sys/mman.h>
+#include <time.h>
 
-void addClock(struct time* time, int sec, int ns);
-void cleanUp();
-void ossExit(int sig);
-int getProcessId();
-void startOSS();
-void shiftReference();
-void printResources();
-void insert(int pageId, int pid);
+#include "shm_header.h"
 
-FILE *fp;
-int lines = 0;
-int toChild;
-int toOSS;
-int shmid;
-int takenPids[18];
-
-struct{
-	long mtype;
-	char msg[10];
-}msgbuf;
-
-struct Page{
-	int frame;
-	int swap;
-};
-
-struct PageTable{
-	struct Page frames[32];
-};
-
-struct Frame{
-	int pid;
-	unsigned dirtyBit : 1;//1 bit
-	unsigned ref : 8;//8 bit
-};
-
-struct Memory{
-	struct Frame frameTable[256];
-	struct PageTable pageTables[18];//A page table for each potential process
-};
-
-struct sharedRes *shared;
-struct Queue *waiting; 
-struct Memory memory;
+#define PERM 0666
+#define MAXCHILD 18
+#define MAXFRAMES 256
 
 
-int pageFaults;
-int requests;
-int n = 0;//Number of processes in system
+const int TOTAL_SLAVES = 100;
+const int MAXSLAVES = 20;
+const long long INCREMENTER = 40;
+long long int nextProcessSpawnTime = 0;
+int count = 0;
+int victims[999999] = {-1};
 
-#define BYTE_TO_BINARY_PATTERN "%c%c%c%c%c%c%c%c"
-#define BYTE_TO_BINARY(byte) \
-	(byte & 0x80 ? '1' : '0'), \
-	(byte & 0x40 ? '1' : '0'), \
-	(byte & 0x20 ? '1' : '0'), \
-	(byte & 0x10 ? '1' : '0'), \
-	(byte & 0x08 ? '1' : '0'), \
-	(byte & 0x04 ? '1' : '0'), \
-	(byte & 0x02 ? '1' : '0'), \
-	(byte & 0x01 ? '1' : '0')
-int main(int argc, char *argv[]){
-	int c;	
-	while((c=getopt(argc, argv, "n:h"))!= EOF){
-		switch(c){
-			case 'h':
-				printf("-v: Set v to 1 for verbose on, or to 0 for verbose off.\n");
-				exit(0);
-				break;
-			case 'n':
-				n = atoi(optarg);
-				if(n > 18){
-					printf("n can be no greater than 18. Setting variable to 18 now.\n");
-					n = 18;
-				}
-				break;
+//initialize frame stuff
+const int TOTAL_FRAMES = 256; // each frame is 1k = 1024
+static int free_frames = 0;
+int num_mem_access = 0;
+int num_page_faults = 0;
+int allocated_frames[TOTAL_FRAMES] = {0};
+PageTable *mainPageTable;
+void second_chance_alloc();
+void display_page_table();
+
+void showHelpMessage();
+void intHandler(int);
+void spawnChildren(int);
+void cleanup();
+void sweep_daemon();
+int nextSpawnTime();
+void setNextSpawnTime();
+void sendMessage(int, int);
+void processDeath(int, int, FILE*);
+
+static int max_processes_at_instant = 1; // to count the max running processes at any instance
+int process_spawned = 0; // hold the process number
+volatile sig_atomic_t cleanupCalled = 0;
+key_t key;
+key_t shMsgIDKey = 1234;
+key_t shmPageTableIDKey = 1235;
+int shmPageTableID;
+int shmid, shmMsgID, semid, i;
+pid_t childpid;
+shared_oss_struct *shpinfo;
+shmMsg *ossShmMsg;
+int timerVal;
+int numChildren;
+int slaveQueueId;
+int masterQueueId;
+char *short_options = "hs:l:t:";
+char *default_logname = "default.log";
+char c;
+FILE* file;
+int status;
+int messageReceived = 0;
+struct msqid_ds msqid_ds_buf;
+
+char *i_arg;
+char *m_arg;
+char *x_arg;
+char *s_arg;
+char *k_arg;
+char *p_arg;
+
+int main(int argc, char const *argv[])
+{
+	sem_t *semlockp;
+	int helpflag = 0;
+	int nonoptargflag = 0;
+	int index;
+	key_t masterKey = 128464;
+  	key_t slaveKey = 120314;
+
+	// create the queue
+	create();
+
+	// memory for args
+	i_arg = malloc(sizeof(char)*20);
+	m_arg = malloc(sizeof(char)*20);
+	x_arg = malloc(sizeof(char)*20);
+	s_arg = malloc(sizeof(char)*20);
+	k_arg = malloc(sizeof(char)*20); 
+	p_arg = malloc(sizeof(char)*20);
+
+	opterr = 0;
+
+	while ((c = getopt (argc, argv, short_options)) != -1)
+	switch (c) {
+		case 'h':
+			helpflag = 1;
+			break;
+		case 's':
+			numChildren = atoi(optarg);
+			if(numChildren > MAXCHILD) {
+			  numChildren = MAXCHILD;
+			  fprintf(stderr, "No more than 18 child processes allowed at one instance. Reverting to 18.\n");
+			}
+			break;
+		case 't':
+			timerVal = atoi(optarg);  
+			break;
+		case 'l':
+			default_logname = optarg;  
+			break;
+		case '?':
+			if (optopt == 's') {
+			  fprintf(stderr, "Option -%c requires an argument. Using default value [5].\n", optopt);
+			  numChildren = 5;
+			}
+			else if (optopt == 't') {
+			  fprintf(stderr, "Option -%c requires an argument. Using default value [20].\n", optopt);
+			  timerVal = 50;
+			}
+			else if( optopt == 'l') {
+			  fprintf(stderr, "Option -%c requires an argument. Using default value [default.log] .\n", optopt);
+			  default_logname = "default.log";
+			}
+			else if (isprint (optopt)) {
+			  fprintf(stderr, "Unknown option -%c. Terminating.\n", optopt);
+			  return -1;
+			}
+			else {
+			  showHelpMessage();
+			  return 0; 
+			}
+	}
+
+	//print out all non-option arguments
+	for (index = optind; index < argc; index++) {
+		fprintf(stderr, "Non-option argument %s\n", argv[index]);
+		nonoptargflag = 1;
+	}
+
+	//if above printed out, print help message
+	//and return from process
+	if(nonoptargflag) {
+		showHelpMessage();
+		return 0;
+	}
+
+	//if help flag was activated, print help message
+	//then return from process
+	if(helpflag) {
+		showHelpMessage();
+		return 0;
+	}
+
+	if( numChildren<=0 || timerVal<=0 ) {
+		showHelpMessage();
+		return 0;
+	}
+
+	// handle SIGNALS callback attached
+	signal(SIGALRM, intHandler);
+	signal(SIGINT, intHandler);
+	signal(SIGCHLD, SIG_IGN);
+	signal(SIGQUIT, SIG_IGN);
+
+	//set alarm
+	alarm(200);
+
+	// generate key using ftok
+	key = ftok(".", 'c');
+
+	// key = SHM_KEY;
+	if(key == (key_t)-1) {
+		fprintf(stderr, "Failed to derive key\n");
+	}
+
+	if((slaveQueueId = msgget(slaveKey, IPC_CREAT | 0777)) == -1) {
+		perror("Master msgget for slave queue");
+		exit(-1);
+	}
+
+	if((masterQueueId = msgget(masterKey, IPC_CREAT | 0777)) == -1) {
+		perror("Master msgget for master queue");
+		exit(-1);
+	}
+
+	shmid = shmget(key, sizeof(shared_oss_struct), IPC_CREAT | 0777);
+	if((shmid == -1) && (errno != EEXIST)){
+		perror("Unable to create shared mem");
+		exit(-1);
+	}
+	if(shmid == -1) {
+		if (((shmid = shmget(key, sizeof(shared_oss_struct), PERM)) == -1) || 
+			(shpinfo = (shared_oss_struct*)shmat(shmid, NULL, 0) == (void *)-1) ) {
+			perror("Unable to attach existing shared memory");
+			exit(-1);
 		}
-	}
-
-	if(n == 0){
-		n = 6;
-	}
-	srand(time(NULL));
-	//Attach shared memory	
-	key_t key;
-	key = ftok(".",'a');
-	if((shmid = shmget(key,sizeof(struct sharedRes), IPC_CREAT | 0666)) == -1){		
-		perror("shmget");
-		exit(1);	
-	}
-	
-	shared = (struct sharedRes*)shmat(shmid,(void*)0,0);
-	if(shared == (void*)-1){
-		error("Error on attaching memory");
-	}
-
-	//Attach queues for communication between processes
-	key_t msgkey;
-	if((msgkey = ftok("msgQueue1",925)) == -1){
-		perror("ftok");
-	}
-
-	if((toChild = msgget(msgkey, 0600 | IPC_CREAT)) == -1){
-		perror("msgget");	
-	}	
-	
-	if((msgkey = ftok("msgQueue2",825)) == -1){
-		perror("ftok");
-	}
-
-	if((toOSS = msgget(msgkey, 0600 | IPC_CREAT)) == -1){
-		perror("msgget");	
-	}
-
-	fp = fopen("osslog.txt","w");
-	
-	printf("OSS will be done momentarily\n");
-	printf("Generating ouput in osslog.txt now...\n");
-	
-	//Setting default values in table
-	int i,k;
-	for(i = 0; i < 256; i++){
-		memory.frameTable[i].ref = 0x0;
-		memory.frameTable[i].dirtyBit = 0x0;
-		memory.frameTable[i].pid = -1;
-	}
-	
-	for(i = 0; i < 18; i++){
-		for(k = 0; k < 32; k++){
-			memory.pageTables[i].frames[k].frame = -1;
-			memory.pageTables[i].frames[k].swap = -1;
+	} else {
+		shpinfo = shmat(shmid, NULL, 0);
+		if(shpinfo == (void *)-1){
+			perror("Couldn't attach the shared mem");
+			exit(-1);
 		}
+
+		// initialize shmem params
+		// initalize clock to zero
+
+		shpinfo -> seconds = 0;
+		shpinfo -> nanoseconds = 0;
+		shpinfo -> sigNotReceived = 1;
+		strcpy(shpinfo -> shmMsg, "");
+
 	}
 
-	//Setting up signals
-	signal(SIGALRM, ossExit);
-	alarm(2);
-	signal(SIGINT, ossExit);
+	shmMsgID = shmget(shMsgIDKey, sizeof(shmMsg), IPC_CREAT | 0777);
+	if((shmMsgID == -1) && (errno != EEXIST)){
+		perror("Unable to create shared mem");
+		exit(-1);
+	}
+	if(shmMsgID == -1) {
+		if (((shmMsgID = shmget(shMsgIDKey, sizeof(shmMsg), PERM)) == -1) || 
+			(ossShmMsg = (shmMsg*)shmat(shmMsgID, NULL, 0) == (void *)-1) ) {
+			perror("Unable to attach existing shared memory");
+			exit(-1);
+		}
+	} else {
+		ossShmMsg = shmat(shmMsgID, NULL, 0);
+		if(ossShmMsg == (void *)-1){
+			perror("Couldn't attach the shared mem");
+			exit(-1);
+		}
 
-	startOSS();
-	cleanUp(shmid, shared);
-}
+		ossShmMsg -> seconds = -1;
+		ossShmMsg -> nanoseconds = -1;
+		ossShmMsg -> procID = -1;
 
+	}
 
+	shmPageTableID = shmget(shmPageTableIDKey, sizeof(PageTable), IPC_CREAT | 0777);
+	if((shmPageTableID == -1) && (errno != EEXIST)){
+		perror("Unable to create shared mem");
+		exit(-1);
+	}
+	if(shmPageTableID == -1) {
+		if (((shmPageTableID = shmget(shmPageTableIDKey, sizeof(PageTable), PERM)) == -1) || 
+			(mainPageTable = (PageTable*)shmat(shmPageTableID, NULL, 0) == (void *)-1) ) {
+			perror("Unable to attach existing shared memory");
+			exit(-1);
+		}
+	} else {
+		mainPageTable = (PageTable*)shmat(shmPageTableID, NULL, 0);
+		if(mainPageTable == (void *)-1){
+			perror("Couldn't attach the shared mem");
+			exit(-1);
+		}
 
-void startOSS(){
-	int i = 0;
-	struct time randFork;
-	int nextFork = (rand() % (500000000 - 1000000 + 1)) + 1000000;
-	addClock(&randFork,0,nextFork);
-	int active = 0;
-	int count = 0;
-	int maxExecs = 25;
-	pid_t pids[18];
-	//To store procceses that are waiting on a resource
-	waiting = createQueue(n);
-	pid_t child;
-	while(1){
-		//increment clock
-		addClock(&shared->time,0,10000);
-		if(/*(maxExecs > 0)&&*/(active < n) && ((shared->time.seconds > randFork.seconds) || (shared->time.seconds == randFork.seconds && shared->time.nanoseconds >= randFork.nanoseconds))){
+		for (i=0; i < MAXFRAMES; i++) {
+			mainPageTable->frameID = i; 
+			mainPageTable->frames[i].isFrameAssigned = 0;
+			mainPageTable->frames[i].referenceBit = -1;  // -1 unused, ,0 - used, 1 - second chance
+			mainPageTable->frames[i].page.pageID = -1;
+			mainPageTable->frames[i].page.unused = 1;
+			mainPageTable->frames[i].page.second_chance = 0; // if on a second chance its 2, [0,1,2]
+			mainPageTable->frames[i].page.dirty = 0; // initially not dirty
+			mainPageTable->frames[i].page.valid = 0; // 1 - valid, 0 - invalid
+		}
+
+	}
+
+	//Open file and mark the beginning of the new log
+	file = fopen(default_logname, "a");
+	if(!file) {
+		perror("Error opening file");
+		exit(-1);
+	}
+
+	fprintf(file,"***** BEGIN LOG *****\n");
+
+	// Fork Off Processes
+	spawnChildren(MAXCHILD - 1);
+
+	// loop through clock and keep checking shmMsg
+
+	//while(messageReceived < TOTAL_SLAVES && shpinfo -> seconds < 2 && shpinfo->sigNotReceived) {
+	while(messageReceived < TOTAL_SLAVES && shpinfo -> seconds < 150 && shpinfo->sigNotReceived) {
+
+		if ( nextSpawnTime() && max_processes_at_instant < MAXCHILD) {
+			if ( max_processes_at_instant < MAXCHILD ) {
+				spawnChildren(MAXCHILD - max_processes_at_instant); // spawn upto max 18 processes
+				setNextSpawnTime();
+			} else {
+				setNextSpawnTime();
+				if ( DEBUG )
+					fprintf(stderr, "MAX PROCESSES HIT. TRYING TO SPAWN IN NEXT TIME.");
+			}
+			if ( DEBUG )
+				fprintf(stderr, "MAX PROCESSES RUNNING NOW : %d\n", max_processes_at_instant);
 			
-			//set time for next fork
-			randFork.seconds = shared->time.seconds;
-			randFork.nanoseconds = shared->time.nanoseconds;
-			nextFork = (rand() % (500000000 - 1000000 + 1)) + 1000000;
-			addClock(&randFork,0,nextFork);
-			int newProc = getProcessId() + 1;
-			
-			if((newProc-1 > -1)){
-				if(lines < 10000){
-					fprintf(fp,"Master: Generated new process with PID %d at time %d:%d\n",newProc,shared->time.seconds,shared->time.nanoseconds);
-					lines++;
-				}
-				pids[newProc - 1] = fork();
-				if(pids[newProc - 1] == 0){
-					char str[10];
-					sprintf(str, "%d", newProc);
-					execl("./user",str,NULL);
-					exit(0);
-				}
-				maxExecs--;			
-				active++;
-			}	
 		}
-
-		if(msgrcv(toOSS, &msgbuf, sizeof(msgbuf),0,IPC_NOWAIT) > -1){
-			int pid = msgbuf.mtype;
-			if (strcmp(msgbuf.msg, "TERMINATED") == 0){
-				while(waitpid(pids[pid - 1],NULL, 0) > 0);
-				int m;
-				takenPids[pid - 1] = 0;		
-				count++;
-				active--;
-				if(lines < 10000){
-					fprintf(fp,"Master: Process with PID %d has terminated at time %d:%d\n",pid,shared->time.seconds,shared->time.nanoseconds);		
-					lines++;
-				}
-			}
-			else if (strcmp(msgbuf.msg, "WRITE") == 0){
-				requests++; 
-				//Recieve resource to release
-				msgrcv(toOSS, & msgbuf, sizeof(msgbuf),pid,0);
-				int writePos = atoi(msgbuf.msg);
-				if(lines < 10000){
-					fprintf(fp,"Master: Detected write request for %d from PID: %d at time %d:%d\n",writePos,pid,shared->time.seconds,shared->time.nanoseconds);
-					lines++;
-				}
-				if(memory.pageTables[pid - 1].frames[writePos].frame == -1){
-					if(lines > 10000){
-						fprintf(fp,"Master: Page fault(Page not found)-Page %d for PID: %d at time %d:%d\n",writePos,pid,shared->time.seconds,shared->time.nanoseconds);
-						lines++;
-					}
-					pageFaults++;
-					shared->processes[pid - 1].pid = pid-1;
-					shared->processes[pid - 1].unblock = 1;
-					shared->processes[pid - 1].frame = writePos;
-					
-					//Each read/request taking about 15ms
-					int time = (rand() & (150000000 - 10000000 + 1)) + 10000000;
-					addClock(&shared->processes[pid-1].unblockTime,0,time);
-					enqueue(waiting,pid);
-
-				}else if(memory.pageTables[pid - 1].frames[writePos].swap == 0){	
-					if(lines < 10000){
-						fprintf(fp,"Master: Write request granted for PID: %d at time %d:%d\n",pid,shared->time.seconds,shared->time.nanoseconds);				
-						lines++;
-					}
-					strcpy(msgbuf.msg,"WRITEGRANTED");
-					msgbuf.mtype = pid;
-					addClock(&shared->time,0,100000);
-					int framePos = memory.pageTables[pid - 1].frames[writePos].frame;
-					memory.frameTable[framePos].dirtyBit = 0x1;
-					memory.frameTable[framePos].ref = memory.frameTable[framePos].ref | 0x80;
-					msgsnd(toChild, &msgbuf,sizeof(msgbuf),IPC_NOWAIT);
-				}else if(memory.pageTables[pid - 1].frames[writePos].swap == 1){
-					if(lines < 10000){
-						fprintf(fp,"Master: Page fault(Swap) - Page: %d for PID: %d at time %d:%d\n",writePos,pid,shared->time.seconds,shared->time.nanoseconds);
-						lines++;
-					}
-					pageFaults++;
-					shared->processes[pid - 1].pid = pid-1;
-					shared->processes[pid - 1].unblock = 1;
-					shared->processes[pid - 1].frame = writePos;
-					
-					//Each read/request taking about 15ms
-					int time = (rand() & (150000000 - 10000000 + 1)) + 10000000;
-					addClock(&shared->processes[pid-1].unblockTime,0,time);
-					enqueue(waiting,pid);
-					
-				}
-			}
-			else if (strcmp(msgbuf.msg, "REQUEST") == 0){
-				requests++; 
-				//Get resource from user
-				msgrcv(toOSS,&msgbuf,sizeof(msgbuf),pid,0);	
-				int pageId = atoi(msgbuf.msg);	
-				if(lines < 10000){
-					fprintf(fp,"Master: Detected read request for %d from PID: %d at time %d:%d\n",pageId,pid,shared->time.seconds,shared->time.nanoseconds);
-					lines++;
-				}
-				//Frame exists in memory
-				if(memory.pageTables[pid - 1].frames[pageId].frame == -1){
-					if(lines < 10000){
-						fprintf(fp,"Master: Page fault(Page not found)-Page %d for PID: %d at time %d:%d\n",pageId,pid,shared->time.seconds,shared->time.nanoseconds);
-						lines++;
-					}
-					pageFaults++;
-					shared->processes[pid - 1].pid = pid-1;
-					shared->processes[pid - 1].unblock = 0;
-					shared->processes[pid - 1].frame = pageId;
-					//Each read/request taking about 15ms
-					int time = (rand() & (150000000 - 10000000 + 1)) + 10000000;
-					addClock(&shared->processes[pid-1].unblockTime,0,time);
-					enqueue(waiting,pid);
-
-				}else if(memory.pageTables[pid - 1].frames[pageId].swap == 0){	
-					if(lines < 10000){
-						fprintf(fp,"Master: Read Request granted for PID: %d at time %d:%d\n",pid,shared->time.seconds,shared->time.nanoseconds);				
-						lines++;
-					}
-					strcpy(msgbuf.msg,"READGRANTED");
-					msgbuf.mtype = pid;
-					addClock(&shared->time,0,10);	
-					int framePos = memory.pageTables[pid - 1].frames[pageId].frame;	
-					memory.frameTable[framePos].ref = memory.frameTable[framePos].ref | 0x80;
-					msgsnd(toChild, &msgbuf,sizeof(msgbuf),IPC_NOWAIT);
-				}else if(memory.pageTables[pid - 1].frames[pageId].swap == 1){
-					if(lines < 10000){
-						fprintf(fp,"		Master: Page fault(Swap) - Page: %d for PID: %d at time %d:%d\n",pageId,pid,shared->time.seconds,shared->time.nanoseconds);
-						lines++;
-					}
-					pageFaults++;
-					shared->processes[pid - 1].pid = pid-1;
-					shared->processes[pid - 1].unblock = 0;
-					shared->processes[pid - 1].frame = pageId;
-					
-					//Each read/request taking about 15ms
-					int time = (rand() & (150000000 - 10000000 + 1)) + 10000000;
-					addClock(&shared->processes[pid-1].unblockTime,0,time);
-					enqueue(waiting,pid);
-					
-				}
-				
-			}
-			if(((requests%100)==0) && requests != 0){
-				shiftReference();
-				printResources();
-			}
-		} 
 		
-		//Check if waiting processes can be given a resource	
-		int k = 0;
-		if(isEmpty(waiting) == 0){
-			int size = queueSize(waiting);
-			while(k < size){
-				int pid = dequeue(waiting);
-				if(((shared->time.seconds > shared->processes[pid-1].unblockTime.seconds) || (shared->time.seconds == shared->processes[pid-1].unblockTime.seconds && shared->time.nanoseconds >= shared->processes[pid-1].unblockTime.nanoseconds))){		
-					//Get page requested from shared memory			
-					int pageId = shared->processes[pid - 1].frame;
-					//Setting reference byte
-					int framePos = memory.pageTables[pid - 1].frames[pageId].frame;	
-					memory.frameTable[framePos].ref = memory.frameTable[framePos].ref | 0x80;
-					
-					if(shared->processes[pid-1].unblock == 0){
-						if(memory.pageTables[pid - 1].frames[pageId].frame == -1 || memory.pageTables[pid - 1].frames[pageId].swap == 1){
-							//insert page			
-							insert(pageId,pid);
-						}
+		//fprintf(stderr, "CURRENT MASTER TIME : %ld.%ld\n", shpinfo -> seconds, shpinfo -> nanoseconds);
+		shpinfo -> nanoseconds += INCREMENTER;
+		if( shpinfo -> nanoseconds == 1000000000 ) {
+			shpinfo -> seconds += 1;
+			shpinfo -> nanoseconds = 0;
+			display_page_table();
+		}
 
-						msgbuf.mtype = pid;
-						strcpy(msgbuf.msg,"READGRANTED");
-						msgsnd(toChild,&msgbuf,sizeof(msgbuf),IPC_NOWAIT);
-						if(lines < 10000){
-							fprintf(fp,"Master: Read granted on page: %d for PID: %d at time %d:%d\n",pageId,pid,shared->time.seconds,shared->time.nanoseconds);
-							lines++;
-						}
-					}else if(shared->processes[pid-1].unblock == 1){
-						//Setting dirty bit for the write
-						memory.frameTable[framePos].dirtyBit = 0x1;
-						if(memory.pageTables[pid - 1].frames[pageId].frame == -1 || memory.pageTables[pid - 1].frames[pageId].swap == 1){
-							//insert page
-							insert(pageId,pid);
+		if ( ossShmMsg -> procID != -1 ) {
+			fprintf(file, "Master: Child %d is terminating at %lld.%lld at my time %lld.%lld\n", ossShmMsg -> procID, ossShmMsg -> seconds, ossShmMsg -> nanoseconds, shpinfo -> seconds, shpinfo -> nanoseconds);
+			fprintf(file, "MAX PROCESSES RUNNING AT OSS %lld.%lld : %d\n", shpinfo -> seconds, shpinfo -> nanoseconds, max_processes_at_instant);
+			fprintf(file, "PAGE NUM REQUESTED : %d for R/W(0/1) : %d\n\n\n", ossShmMsg -> pageNumRequested, ossShmMsg -> readwrite);
+			ossShmMsg -> procID = -1;
+			max_processes_at_instant--;
 
-						}
+			// enqueue the request here
+			enq(ossShmMsg -> pageNumRequested);
+			//show the queue
+			fprintf(file, "Master: Page Frame Request Queue:\n");
+			display();
+			fprintf(file, "---\n\n");
 
-						msgbuf.mtype = pid;
-						strcpy(msgbuf.msg,"WRITEGRANTED");
-						msgsnd(toChild,&msgbuf,sizeof(msgbuf),IPC_NOWAIT);
-						if(lines < 10000){
-							fprintf(fp,"Master: Write granted on page: %d for PID: %d at time %d:%d\n",pageId,pid,shared->time.seconds,shared->time.nanoseconds);
-							lines++;
-						}
-					}
-				}else{
-					enqueue(waiting,pid);
-				}
-				k++;
+			// second chance page alloc algo
+			second_chance_alloc();
+		}
+
+		
+		//processDeath(masterQueueId, 3, file);
+
+	    //fprintf(stderr, "CURRENT MASTER TIME : %ld.%ld\n", shpinfo -> seconds, shpinfo -> nanoseconds);
+	}
+
+	// Cleanup
+
+	if(!cleanupCalled) {
+		cleanupCalled = 1;
+		printf("Master cleanup called from main\n");
+		cleanup();
+	}
+
+	return 0;
+}
+
+void processDeath(int qid, int msgtype, FILE *file) {
+  struct msgbuf msg;
+  if(msgrcv(qid, (void *) &msg, sizeof(msg.mText), msgtype, MSG_NOERROR | IPC_NOWAIT) == -1) {
+    if(errno != ENOMSG) {
+      perror("Master msgrcv");
+    }
+  }
+  else {
+    msgctl(masterQueueId, IPC_STAT, &msqid_ds_buf);
+    messageReceived++;
+    max_processes_at_instant--;
+  }
+}
+
+// spawnChildren function
+void spawnChildren(int childrenCount) {
+	int j;
+
+	for (j = 0; j < childrenCount; ++j){
+		printf("About to spawn process #%d\n", max_processes_at_instant);
+		
+		//perror on bad fork
+	    if((childpid = fork()) < 0) {
+	      perror("Fork Failure");
+	      //exit(1);
+	    }
+
+		/* child process */
+		if(childpid == 0) {
+			
+			fprintf(stderr, "Max processes running now: %d\n", max_processes_at_instant);
+			childpid = getpid();
+      		pid_t gpid = getpgrp();
+			sprintf(i_arg, "%d", j);
+			sprintf(s_arg, "%d", max_processes_at_instant);
+			sprintf(x_arg, "%d", shmMsgID);
+			sprintf(p_arg, "%d", shmPageTableID);
+			// share shmid with children
+			sprintf(k_arg, "%d", shmid);
+			char *userOptions[] = {"./user", "-i", i_arg, "-s", s_arg, "-k", k_arg, "-x", x_arg, "-p", p_arg, (char *)0};
+			execv("./user", userOptions);
+			fprintf(stderr, "Print if error %s\n");
+		}
+		max_processes_at_instant++;
+	}	
+}
+
+// Detach and remove sharedMem function
+int detachAndRemove(int shmid, shared_oss_struct *shmaddr) {
+  printf("Master: Remove Shared Memory\n");
+  int error = 0;
+  if(shmdt(shmaddr) == -1) {
+    error = errno;
+  }
+  if((shmctl(shmid, IPC_RMID, NULL) == -1) && !error) {
+    error = errno;
+  }
+  if(!error) {
+    return 0;
+  }
+
+  return -1;
+}
+
+void cleanup() {
+  signal(SIGQUIT, SIG_IGN);
+  shpinfo -> sigNotReceived = 0;
+  printf("Master sending SIGQUIT\n");
+  kill(-getpgrp(), SIGQUIT);
+
+  //free up the malloc'd memory for the arguments
+  free(i_arg);
+  free(s_arg);
+  free(k_arg);
+  free(x_arg);
+  printf("Master waiting on all processes do die\n");
+  childpid = wait(&status);
+  	
+  printf("Master about to detach from shared memory\n");
+  //Detach and remove the shared memory after all child process have died
+  if(detachAndRemove(shmid, shpinfo) == -1) {
+    perror("Failed to destroy shared memory segment");
+  }
+
+  if(detachAndRemove(shmMsgID, ossShmMsg) == -1) {
+    perror("Failed to destroy shared memory segment");
+  }
+
+  if(fclose(file)) {
+    perror("    Error closing file");
+  }
+
+  printf("Master about to kill itself\n");
+  //Kill this master process
+  kill(getpid(), SIGKILL);
+}
+
+// handle interrupts
+void intHandler(int SIGVAL) {
+	signal(SIGQUIT, SIG_IGN);
+	signal(SIGINT, SIG_IGN);
+
+	if(SIGVAL == SIGINT) {
+		fprintf(stderr, "%sCTRL-C Interrupt initiated.\n");
+	}
+
+	if(SIGVAL == SIGALRM) {
+		fprintf(stderr, "Master timed out. Terminating rest all process.\n");
+	}
+
+	kill(-getpgrp(), SIGQUIT);
+
+}
+
+
+
+// setting next spawn time
+void setNextSpawnTime() {
+	nextProcessSpawnTime = (shpinfo -> seconds * NANO_MOD) + shpinfo -> nanoseconds + (rand() % 500000000 + 1000000); // add 1-500 ms randomly
+	if ( DEBUG )
+		fprintf(stderr, "\nNext child spawn time : %lld.%lld.\n\n", nextProcessSpawnTime / NANO_MOD, nextProcessSpawnTime % NANO_MOD );
+}
+
+// check for next spawn time
+int nextSpawnTime() {
+	if ( ((shpinfo -> seconds * NANO_MOD) + shpinfo -> nanoseconds) >= nextProcessSpawnTime ) {
+		if ( DEBUG )
+			fprintf(stderr, "\nNext child spawn time hit at : %lld.%lld.\n\n", nextProcessSpawnTime / NANO_MOD, nextProcessSpawnTime % NANO_MOD );
+		return 1;
+	}
+	return 0;
+}
+
+// help message for running options
+void showHelpMessage() {
+	printf("-h: Prints this help message.\n");
+    printf("-s: Allows you to set the number of child process to run.\n");
+    printf("\tThe default value is 5. The max is 20.\n");
+    printf("-l: filename for the log file.\n");
+    printf("\tThe default value is 'default.log' .\n");
+    printf("-t: Allows you set the wait time for the master process until it kills the slaves and itself.\n");
+    printf("\tThe default value is 20.\n");
+}
+
+/* Create an empty queue */
+void create()
+{
+    front = rear = NULL;
+}
+ 
+/* Returns queue size */
+void queuesize()
+{
+    fprintf(stderr, "\n Queue size : %d", count);
+}
+ 
+/* Enqueing the queue */
+void enq(int data)
+{
+    if (rear == NULL)
+    {
+        rear = (struct node *)malloc(1*sizeof(struct node));
+        rear->ptr = NULL;
+        rear->pageNum = data;
+        front = rear;
+    }
+    else
+    {
+        temp=(struct node *)malloc(1*sizeof(struct node));
+        rear->ptr = temp;
+        temp->pageNum = data;
+        temp->ptr = NULL;
+ 
+        rear = temp;
+    }
+    count++;
+}
+ 
+/* Displaying the queue elements */
+void display()
+{
+    front1 = front;
+ 
+    if ((front1 == NULL) && (rear == NULL))
+    {
+        printf("Queue is empty");
+        return;
+    }
+    while (front1 != rear)
+    {
+		//printf("%d ", front1->pageNum);
+		fprintf(file, "%d ", front1->pageNum);
+        front1 = front1->ptr;
+    }
+    if (front1 == rear) {
+        //printf("%d", front1->pageNum);
+		fprintf(file, "%d ", front1->pageNum);
+	}
+}
+ 
+/* Dequeing the queue */
+int deq()
+{
+	int pageNumberDeq = -1;
+    front1 = front;
+ 
+    if (front1 == NULL)
+    {
+        printf("\n Error: Trying to display elements from empty queue");
+        return -1;
+    }
+    else
+        if (front1->ptr != NULL)
+        {
+            front1 = front1->ptr;
+            printf("\n Dequed value : %d", front->pageNum);
+			pageNumberDeq = front->pageNum;
+            free(front);
+            front = front1;
+        }
+        else
+        {
+			pageNumberDeq = front->pageNum;
+            printf("\n Dequed value : %d", front->pageNum);
+            free(front);
+            front = NULL;
+            rear = NULL;
+        }
+        count--;
+		return pageNumberDeq;
+}
+ 
+/* Returns the front element of queue */
+int frontelement()
+{
+    if ((front != NULL) && (rear != NULL))
+        return(front->pageNum);
+    else
+        return 0;
+}
+ 
+/* Display if queue is empty or not */
+void empty()
+{
+     if ((front == NULL) && (rear == NULL))
+        fprintf(stderr, "\n Queue empty");
+    else
+       fprintf(stderr, "Queue not empty");
+}
+
+
+void second_chance_alloc() { 
+
+	int pos = 0, k = 0, page_found = 0;
+	int pageNumRequested = frontelement();
+	// check if page is already in there
+	for( k = 0; k < MAXFRAMES; k++ ) {
+		if ( mainPageTable->frames[k].page.pageID == pageNumRequested) {
+			page_found = 1;
+			pos = k;
+			break;
+		}
+	}
+	if( page_found ) {
+		// give a chance or set it to be removed from page table
+		if ( mainPageTable->frames[pos].referenceBit == 0 ){
+			if ( mainPageTable->frames[pos].page.second_chance != 2 ) {
+				mainPageTable->frames[pos].referenceBit = 1; // gets chance
+			}else{
+				mainPageTable->frames[pos].referenceBit = 0; // already given second chance
+				mainPageTable->frames[pos].page.dirty = 1;
+			}
+		} else if ( mainPageTable->frames[pos].referenceBit == 1 ) {
+			mainPageTable->frames[pos].referenceBit = 0;
+			mainPageTable->frames[pos].page.dirty = 1;
+			mainPageTable->frames[pos].page.second_chance += 1;
+		}
+	} else {
+		// check if page table has space
+		for( k = 0; k < MAXFRAMES; k++ ) {
+			if ( mainPageTable->frames[k].referenceBit == -1) {
+				pos = k;
+				mainPageTable->delimiter = pos;
+				break;
 			}
 		}
-	}
-	printf("Out of simulation\n");
-	int status;
-	pid_t wpid;//wait for any children that haven't quite finished yet
-	while((wpid = wait(&status)) > 0);
-	
-}
-
-void insert(int pageId, int pid){
-	int i;
-	struct Frame temp;
-	temp.ref = 0xff;
-	int tempPos = -1;
-	
-	for(i = 0; i < 256; i++){
-		//Frame is empty
-		if(memory.frameTable[i].pid == -1){
-			tempPos = i;
-			break;
-		}
-		if(memory.frameTable[i].ref < temp.ref){
-			temp.ref = memory.frameTable[i].ref;
-			tempPos = i;	
-		}
-	}
-	if(tempPos == -1){
-		tempPos = 0;
-	}
-	if(memory.frameTable[tempPos].pid > -1){
-		fprintf(fp,"Swapping frame %d to %d for PID: %d at time %d:%d\n",tempPos, memory.frameTable[tempPos].pid, pid, shared->time.seconds,shared->time.nanoseconds);
-		if(memory.frameTable[tempPos].dirtyBit == 0x1){
-			addClock(&shared->time,0,100000);//Dirty bit detected (takes more time)
-		}
-		memory.pageTables[pid - 1].frames[pageId].swap = 1;
-	}
-
-	//Clear memory
-	memory.frameTable[tempPos].ref =0x0;
-	memory.frameTable[tempPos].dirtyBit = 0x0;
-	memory.frameTable[tempPos].pid = - 1;
-
-	memory.frameTable[tempPos].pid = pid;
-	memory.frameTable[tempPos].ref = memory.frameTable[tempPos].ref | 0x80;
-
-	memory.pageTables[pid-1].frames[pageId].swap = 0;
-	memory.pageTables[pid-1].frames[pageId].frame = tempPos;
-}
-
-void shiftReference(){
-	int i;
-	for(i = 0; i < 256; i++){
-		memory.frameTable[i].ref = memory.frameTable[i].ref >> 1;
-	}
-}
-
-
-void printResources(){
-	if(lines < 10000){
-		fprintf(fp,"\nCurrent Memory layout at time %d:%d\n",shared->time.seconds,shared->time.nanoseconds);
-		fprintf(fp,"\t     Occupied\tPID\tRef\t   DirtyBit\n");
-		lines = lines + 2;
-	}
-	int i;
-	for(i = 0; i < 256; i++){
-			if(lines < 10000){	
-				fprintf(fp,"Frame %d:\t",i + 1);
-				if(memory.frameTable[i].pid != -1){
-					fprintf(fp,"Yes\t");
-				}else{
-					fprintf(fp,"No\t");
-				}
-				fprintf(fp,"%d\t",memory.frameTable[i].pid);
-				fprintf(fp,"%c%c%c%c%c%c%c%c\t",BYTE_TO_BINARY(memory.frameTable[i].ref));
-				fprintf(fp,"%x\t",memory.frameTable[i].dirtyBit);
-				fprintf(fp,"\n");		
-				lines++;
+		if(pos == MAXFRAMES) {
+			// page table full. Try to remove a page
+			int victim_index = -1, iter = 0;
+			while( mainPageTable->frames[iter].referenceBit != 1) {
+				iter++;
 			}
-	}
-	if(lines < 10000){
-		fprintf(fp,"\n");
-	}
+			// remove the page
+			mainPageTable->frames[pos].page.pageID = -1;
+			mainPageTable->frames[pos].page.dirty = 1;
+			mainPageTable->frames[pos].page.unused = 1;
+			mainPageTable->frames[pos].page.valid = 0;
+			mainPageTable->frames[pos].referenceBit = -1;
 
-}
+			// now add the new page
+			pageNumRequested = deq();
+			mainPageTable->frames[pos].page.pageID = pageNumRequested;
+			mainPageTable->frames[pos].page.dirty = 0;
+			mainPageTable->frames[pos].page.unused = 1;
+			mainPageTable->frames[pos].page.valid = 1;
+			mainPageTable->frames[pos].referenceBit = 0;
+			allocated_frames[pos] = 1;
+			num_page_faults++;
 
-int getProcessId(){
-	int i;
-	int allReleased = 0;
+		} else {
+			pageNumRequested = deq();
+			mainPageTable->frames[pos].page.pageID = pageNumRequested;
+			mainPageTable->frames[pos].page.dirty = 0;
+			mainPageTable->frames[pos].page.unused = 1;
+			mainPageTable->frames[pos].page.valid = 1;
+			mainPageTable->frames[pos].referenceBit = 0;
+			allocated_frames[pos] = 1;
+			num_page_faults++;
+			
+			// for( k=0; k < MAXFRAMES; k++ ) {
+			// 	if( victims[k] == -1 )
+			// 	break;
+			// }
+			// victims[k] = pos;
 
-	for(i = 0; i < 18; i++){
-		if(takenPids[i] == 0){
-			takenPids[i] = 1;
-			return i;
 		}
 	}
-	return -1;
+
 }
 
-//Adds time to the clock structure
-void addClock(struct time* time, int sec, int ns){
-	time->seconds += sec;
-	time->nanoseconds += ns;
-	while(time->nanoseconds >= 1000000000){
-		time->nanoseconds -=1000000000;
-		time->seconds++;
+void display_page_table() {
+	int k = 0;
+	fprintf(file, "\nMaster: Frame Table at : %lld.%lld\n\n", shpinfo->seconds, shpinfo->nanoseconds);
+	for ( k = 0; k < MAXFRAMES; k++ ) {
+		if ( mainPageTable->frames[k].referenceBit == -1 )
+			fprintf(file, ".");
+		else if ( mainPageTable->frames[k].referenceBit == 0 && mainPageTable->frames[k].page.dirty == 1)
+			fprintf(file, "D");
+		else if ( mainPageTable->frames[k].referenceBit == 0 )
+			fprintf(file, "U");
 	}
-}
-
-//Starts the clean up process for OSS
-void ossExit(int sig){
-	float avgPerSecond = ((float)(requests)/((float)(shared->time.seconds)+((float)shared->time.nanoseconds/(float)(1000000000))));
-	float faultsPerAccess = ((float)(pageFaults)/(float)requests);
-	float aveAccTime = (((float)(shared->time.seconds)+((float)shared->time.nanoseconds/(float)(1000000000)))/((float)requests));
-	
-	printf("Page faults: %d\n",pageFaults);
-	printf("Requests: %d\n",requests);
-	printf("Memory access  per second: %f\n",avgPerSecond);	
-	printf("Page faults per access: %f\n",faultsPerAccess);
-	printf("Average access time: %f\n",aveAccTime);
-
-	fprintf(fp,"Page faults: %d\n",pageFaults);
-	fprintf(fp,"Requests: %d\n",requests);
-	fprintf(fp,"Memory access  per second: %f\n",avgPerSecond);	
-	fprintf(fp,"Page faults per access: %f\n",faultsPerAccess);
-	fprintf(fp,"Average access time: %f\n",aveAccTime);
-
-	switch(sig){
-		case SIGALRM:
-			printf("\n2 seconds  has passed. The program will now terminate.\n");
-			break;
-		case SIGINT:
-			printf("\nctrl+c has been registered. Now exiting.\n");
-			break;
+	fprintf(file, "\n");
+	for ( k = 0; k < MAXFRAMES; k++ ) {
+		if ( mainPageTable->frames[k].referenceBit == -1)
+			fprintf(file, "0");
+		else
+			fprintf(file, "%d", mainPageTable->frames[k].referenceBit);
 	}
-	cleanUp();
-	kill(0,SIGKILL);
-}
-
-//Remove shared structures
-void cleanUp(){
-	fclose(fp);
-	msgctl(toOSS,IPC_RMID,NULL);
-	msgctl(toChild,IPC_RMID,NULL);
-	shmdt((void*)shared);	
-	shmctl(shmid, IPC_RMID, NULL);
+	fprintf(file, "\n---\n");
 }
