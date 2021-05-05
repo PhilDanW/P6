@@ -1,20 +1,10 @@
-CC	= gcc
-TARGETS	= oss user 
-OBJS	= oss.o user.o
-SRCDIR  = src
-HEADER = shm_header.h
-LDFLAGS = -pthread -lpthread
+all: oss user
 
-all: $(TARGETS)
-
-$(TARGETS): % : %.o
-		$(CC) -o $@ $< $(LDFLAGS)
-
-$(OBJS) : %.o : $(SRCDIR)/%.c
-		$(CC) -c $< $(LDFLAGS)
-
+oss: oss.c
+	gcc -lrt -o oss oss.c
+	
+user: user.c
+	gcc -lrt -o user user.c
+	
 clean:
-		/bin/rm -f *.o $(TARGETS) *.log *.out
-
-cleanobj: 
-		/bin/rm -f *.o
+	rm oss user *.log
