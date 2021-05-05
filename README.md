@@ -1,6 +1,7 @@
-# P6
+# Project 6
+# Memory Management
 
-Author: Philip Wright
+## Author: Philip Wright
 
 Operating System Simulator: Virtual Memory Management
 Second-Chance FIFO Page Replacement Algorithm
