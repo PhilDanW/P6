@@ -1,9 +1,9 @@
 /* 
  * File:   user.c
- * Author: Michael Beckering
+ * Author: Philip Wright
  * Project 6
- * Spring 2018 CS-4760-E01
- * Created on April 19, 2018, 11:33 AM
+ * Spring 2021 CS-4760-001
+ * Created on April 20, 2021
  */
 
 #include <stdio.h>
